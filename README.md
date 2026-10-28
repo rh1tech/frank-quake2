@@ -1,8 +1,8 @@
 # frank-quake2
 
-Quake II for the RP2350: FRANK / Murmulator M2 boards (HDMI via HSTX) and
-the Waveshare RP2350-PiZero, "Z0" (HDMI via PIO); sound over HDMI or from an
-I2S DAC, 8 MB PSRAM, USB keyboard and mouse, game data on the SD card.
+Quake II for the RP2350: Murmulator M1 (PIO HDMI), M2 (HSTX HDMI) and
+Waveshare RP2350-PiZero "Z0" (PIO HDMI); sound over HDMI or from an I2S DAC,
+8 MB PSRAM, USB keyboard and mouse, game data on the SD card.
 
 The engine is the ESP32-S3 port of Quake II
 ([recrof/Quake2-ESP32S3](https://github.com/recrof/Quake2-ESP32S3), id's
@@ -22,11 +22,11 @@ from frank-castle. Work in progress.
 
 ## Installing
 
-1. Pick the release's firmware for your board and sound output:
-   - M2: `m2p2_frank-quake2_hdmi_A_BB.uf2` (the TV's speakers) or
-     `m2p2_frank-quake2_i2s_A_BB.uf2` (the board's I2S DAC);
-   - Z0 (Waveshare RP2350-PiZero): `z0p2_frank-quake2_hdmi_A_BB.uf2` or
-     `z0p2_frank-quake2_i2s_A_BB.uf2` (an I2S DAC module), see below.
+1. Pick a UF2 for your board, video driver and audio output:
+   - M2: `m2p2-frank-quake2-HSTX-{I2S,HDMI}-...-vA.BB.uf2`;
+   - M1: `m1p2-frank-quake2-PIO-{I2S,HDMI}-...-vA.BB.uf2`;
+   - Z0: `z0p2-frank-quake2-PIO-{I2S,HDMI}-...-vA.BB.uf2`.
+   The filenames also encode CPU MHz, voltage, PSRAM/flash limits and version.
 
    Hold BOOTSEL, plug the board in, and copy it to the RP2350 drive (or
    `picotool load -f FILE.uf2`).
@@ -46,6 +46,15 @@ Saves and `config.cfg` are written to `/quake2/baseq2/`. An optional
 `/quake2/args.txt` adds to the command line (e.g. `+map base1`). No game data
 is included in this repository or in the releases.
 
+### M1 (Murmulator 1.x)
+
+- PIO HDMI on GP6-13 (clock pair GP6/7, data pairs GP8-13); HSTX is not
+  used. Sound over PIO HDMI, or over the board's I2S DAC on GP26/27/28.
+- SD card on SPI0: SCK GP2, MOSI GP3, MISO GP4, CS GP5.
+- QMI PSRAM CS: GP47 on RP2350B or GP19 on RP2350A.
+- PS/2 keyboard on GP0 (CLK) / GP1 (DATA), alongside USB HID host.
+  UART0 is disabled in the game firmware.
+
 ### Z0 (Waveshare RP2350-PiZero)
 
 - Picture and sound on the mini-HDMI port (PIO on GPIO 32-39: the pixels go
@@ -53,10 +62,26 @@ is included in this repository or in the releases.
   each line's blanking), or the sound from an I2S DAC module (PCM5102A):
   DIN GP10, BCK GP11, LRCK GP12.
 - SD card slot (SPI1: 30/31/40/43), PSRAM on board (CS GPIO47).
-- Keyboard and mouse on the native USB port (USB host, through an OTG
-  adapter or hub). The debug UART (GPIO0/1) is not on its header.
+- PS/2 keyboard on GP2 (CLK) / GP3 (DATA), in parallel with USB keyboard
+  and mouse (native USB host through an OTG adapter or hub).
 - PSRAM at 504 / 4 = 126 MHz (the M2 runs it at 168, tuned there): somewhat
   slower until it is tuned on a Z0.
+
+## Flash capacity and partition
+
+Firmware is limited by the linker to **900 KiB** (offset `0x000000..0x0E0FFF`),
+independently of the physical SPI NOR capacity. The flash asset image starts
+at `0x000E1000`, leaving 1148/3196/7292/15484 KiB for models/skins on 2/4/8/16 MiB chips.
+The firmware reads the chip's JEDEC ID at boot *before* initializing PSRAM
+or core 1; unknown/unrecognized densities disable asset writes safely.
+If not all converted models/skins fit, the boot panel reports the required
+and available capacity, number omitted and the first missing asset. Those
+resources are read from PAK files on the SD card into PSRAM as needed; the
+original PAK files are never copied wholesale to SPI NOR.
+After the partition move from `0x1C0000`, the on-board asset cache must
+be rebuilt once. External `mkassets.py` users must specify the target chip
+(`--flash-mb 2/4/8/16`, or an explicit `--size`). `flash.sh assets` now uses
+`0x100E1000`.
 
 ## Models and skins in flash
 
@@ -82,21 +107,39 @@ tools/mkassets.py assets.bin pak2.pak pak1.pak pak0.pak
 The PC image is for 16 MB of flash; for a smaller chip pass
 `--size $(( (8 << 20) - 0x1C0000 ))` (8 MB) to mkassets.py.
 
+### M2 (Murmulator 2.x)
+
+- PS/2 keyboard on GP2 (CLK) / GP3 (DATA) and USB HID concurrently.
+- UART0 is disabled in the game firmware.
+
+## NES/SNES controller
+
+The game polls two serial gamepads in parallel with USB HID and PS/2.
+Pins: M1 CLK=GP14, LATCH=GP15, DATA1/2=GP16/17; M2 GP20/21/26/27;
+Z0 GP4/5/7/8 (order: CLK/LATCH/DATA1/DATA2).
+D-pad = arrow keys; A = Ctrl (fire), B = Space (jump); Start = Esc;
+Select = Tab; SNES Y = Shift, X = / (next weapon), L/R = A/D (strafe).
+The buttons follow normal Quake II keyboard bindings in config.cfg.
+
+I2S outputs at 44.1 kHz with interpolation from the Quake II mixer rate;
+HDMI output is unchanged.
+
 ## Building
 
 ```
 ./build.sh            # M2, 504 MHz CPU, 168 MHz PSRAM, 126 MHz flash, I2S sound
 AUDIO=HDMI ./build.sh # sound over HDMI
+./build.sh M1         # Murmulator 1, PIO HDMI
 ./build.sh Z0         # Waveshare RP2350-PiZero
 ./flash.sh            # picotool, board in BOOTSEL
 ./swd_flash.sh        # or over SWD with a Debugprobe
 ./flash.sh frank-quake2-diag   # bring-up firmware (HDMI, PSRAM, SD, I2S, USB)
-./release.sh [A.BB] [--publish]  # release/m2p2_frank-quake2_{hdmi,i2s}_A_BB.uf2 (+ GitHub release)
+./release.sh [A.BB] [--publish]  # release/{m1p2,m2p2,z0p2}_frank-quake2_*.uf2
 ```
 
 Options (cmake `-D...`):
 
-- `BOARD_VARIANT=M2` (the default) or `Z0`.
+- `BOARD_VARIANT=M2` (the default), `M1` or `Z0`.
 - `AUDIO_TYPE=HDMI` or `I2S` (the default): the sound output.
 - `FLASH_SPEED=168 FLASH_RXDELAY=6`: flash at 168 MHz instead of 126, about
   2.5% faster (the models and skins are read from flash). Above the flash
@@ -109,8 +152,14 @@ Faster, blurrier textures (console or `/quake2/args.txt`): `sw_mipcap 2`
 (+9% in demo1) or `sw_mipscale 2` (+5%). `vsync 0` stops waiting for the
 page flip at 60 Hz: a few % faster, but the picture tears.
 
-Debug console: UART0 on GPIO0/1, 115200. Lines typed there go to the Quake
-console; `~BOOT~` reboots into BOOTSEL.
+A regular CMake/VS Code build writes to `bin/<build type>/`, e.g.
+`bin/Release/m1p2-frank-quake2-PIO-I2S-504MHz-1.65V-P133-F126-v1.05.uf2`
+(or `bin/MinSizeRel/` for that CMake configuration).
+The original `build/frank-quake2.uf2` is retained.
+
+Input: USB HID and PS/2 keyboard simultaneously. M1 uses GP0/1 for PS/2;
+M2 and Z0 use GP2/3. UART is disabled in game builds; the standalone
+HSTX diagnostic firmware retains the UART console for hardware testing.
 
 ## Development
 

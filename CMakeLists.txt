@@ -23,24 +23,27 @@ endif()
 
 cmake_minimum_required(VERSION 3.13)
 
+# M1: Murmulator 1 (PIO HDMI on GPIO 6-13, I2S DAC on 26-28, SD on SPI0).
 # M2: Murmulator 2 (HSTX HDMI on GPIO 12-19, I2S DAC on 9-11, SD on SPI0).
 # Z0: Waveshare RP2350-PiZero (PIO HDMI on GPIO 32-39, an I2S module on
-#     10-12, SD on SPI1); I2S sound only.
-set(BOARD_VARIANT "M2" CACHE STRING "Board: M2 or Z0")
-set_property(CACHE BOARD_VARIANT PROPERTY STRINGS M2 Z0)
-if(BOARD_VARIANT STREQUAL "M2")
+#     10-12, SD on SPI1).
+set(BOARD_VARIANT "M2" CACHE STRING "Board: M1, M2 or Z0")
+set_property(CACHE BOARD_VARIANT PROPERTY STRINGS M1 M2 Z0)
+if(BOARD_VARIANT STREQUAL "M1")
+    set(PICO_BOARD frank_m1_rp2350b)
+elseif(BOARD_VARIANT STREQUAL "M2")
     set(PICO_BOARD frank_m2_rp2350b)
 elseif(BOARD_VARIANT STREQUAL "Z0")
     set(PICO_BOARD frank_z0_rp2350b)
 else()
-    message(FATAL_ERROR "BOARD_VARIANT must be M2 or Z0")
+    message(FATAL_ERROR "BOARD_VARIANT must be M1, M2 or Z0")
 endif()
 set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
 set(CPU_SPEED "504" CACHE STRING "CPU clock in MHz: 252, 378, 504")
 # Tuned on the frank-castle dev board with the diag firmware ('r' sweeps the
 # PSRAM read delay, 'f' the flash one); use 133 MHz PSRAM if a board misbehaves.
-# Z0: untuned yet, 133 MHz (504 / 4 = 126) with the derived read delay.
-if(BOARD_VARIANT STREQUAL "Z0")
+# M1/Z0: untuned, 133 MHz (504 / 4 = 126) with the derived read delay.
+if(BOARD_VARIANT STREQUAL "M1" OR BOARD_VARIANT STREQUAL "Z0")
     set(PSRAM_SPEED_DEFAULT "133")
     set(PSRAM_RXDELAY_DEFAULT "")
 else()
@@ -52,7 +55,11 @@ set(PSRAM_RXDELAY "${PSRAM_RXDELAY_DEFAULT}" CACHE STRING "PSRAM read sampling d
 set(FLASH_SPEED "126" CACHE STRING "Flash chip max frequency in MHz")
 set(FLASH_RXDELAY "5" CACHE STRING "Flash read sampling delay override (empty: derived from the clock)")
 # The model/skin image (tools/mkassets.py) is flashed here; the firmware must end below it.
-set(Q2_ASSETS_OFFSET "0x1C0000" CACHE STRING "Flash offset of the asset image")
+set(Q2_ASSETS_OFFSET "0xE1000" CACHE STRING "Flash offset of the asset image (default 900 KiB)")
+# Migrate the old 1 MiB default kept in an existing CMakeCache.txt.
+if(Q2_ASSETS_OFFSET STREQUAL "0x100000")
+    set(Q2_ASSETS_OFFSET "0xE1000" CACHE STRING "Flash offset of the asset image (default 900 KiB)" FORCE)
+endif()
 set(Q2_SAMPLE_RATE "11025" CACHE STRING "Sound output rate: 11025 or 22050")
 # One output per build: I2S (the board's DAC, GPIO 9-11) or HDMI audio
 # (44.1 kHz data islands, 4x the 11025 Hz mix)
@@ -67,8 +74,9 @@ endif()
 # 3: the game never waits for vsync to free a buffer, but the 76.8 KB it
 # takes leaves no room for the z-buffer in SRAM, which is worth more
 set(Q2_FB_COUNT "2" CACHE STRING "8-bit framebuffers in SRAM: 2 or 3")
-# Native USB is always the keyboard/mouse host; debug console is UART0 (GPIO0/1).
+# Native USB HID and PIO PS/2 operate together; game UART stdio is disabled.
 set(USB_HID_ENABLED ON)
+# PS/2 keyboard and USB HID are enabled concurrently on all three boards.
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -85,12 +93,31 @@ endif()
 # clk_peri (UART, SD card SPI): 0 keeps the 48 MHz USB PLL (SPI 24 MHz at most)
 set(PERI_SPEED "168" CACHE STRING "clk_peri in MHz, from clk_sys (0: 48 MHz from the USB PLL)")
 set(SD_SPEED "42" CACHE STRING "SD card SPI clock in MHz (clk_peri / an even divider)")
-if(BOARD_VARIANT STREQUAL "Z0")
+if(BOARD_VARIANT STREQUAL "M1")
+    set(SD_SPI_BUS spi0)
+    set(SD_PIN_SCK 2)
+    set(SD_PIN_MOSI 3)
+    set(SD_PIN_MISO 4)
+    set(SD_PIN_CS 5)
+    set(PS2_CLK_PIN 0)
+    set(NES_CLK_PIN 14)
+    set(NES_LATCH_PIN 15)
+    set(NES_DATA_PIN 16)
+    set(I2S_DATA_PIN 26)
+    set(I2S_CLK_PIN 27) # and LRCK 28
+    set(I2S_PIO pio1)   # pio0 drives HDMI
+    set(Q2_VIDEO_PIO 1)
+    set(HDMI_PIO_DEFINES HDMI_PIO_BASE_PIN=6 HDMI_PIO_Z0_LAYOUT=0)
+elseif(BOARD_VARIANT STREQUAL "Z0")
     set(SD_SPI_BUS spi1)
     set(SD_PIN_SCK 30)
     set(SD_PIN_MOSI 31)
     set(SD_PIN_MISO 40)
     set(SD_PIN_CS 43)
+    set(PS2_CLK_PIN 2)
+    set(NES_CLK_PIN 4)
+    set(NES_LATCH_PIN 5)
+    set(NES_DATA_PIN 7)
     set(I2S_DATA_PIN 10)
     set(I2S_CLK_PIN 11) # and LRCK 12
     set(I2S_PIO pio1)   # pio0 is the video's, its GPIO window starts at 16
@@ -101,6 +128,10 @@ else()
     set(SD_PIN_MOSI 7)
     set(SD_PIN_MISO 4)
     set(SD_PIN_CS 5)
+    set(PS2_CLK_PIN 2)
+    set(NES_CLK_PIN 20)
+    set(NES_LATCH_PIN 21)
+    set(NES_DATA_PIN 26)
     set(I2S_DATA_PIN 9)
     set(I2S_CLK_PIN 10)
     set(I2S_PIO pio0)
@@ -139,6 +170,8 @@ pico_sdk_init()
 add_subdirectory(drivers/fatfs)
 add_subdirectory(drivers/sdcard)
 add_subdirectory(drivers/usbhid)
+add_subdirectory(drivers/ps2kbd)
+add_subdirectory(drivers/nespad)
 add_subdirectory(drivers/audio)
 
 if(Q2_VIDEO_PIO)
@@ -190,6 +223,10 @@ set(Q2_DEFINES
     Q2_VIDEO_PIO=${Q2_VIDEO_PIO}
     Q2_I2S_PIO=${I2S_PIO}
     Q2_FB_COUNT=${Q2_FB_COUNT}
+    Q2_PS2_CLK_PIN=${PS2_CLK_PIN}
+    Q2_NES_CLK_PIN=${NES_CLK_PIN}
+    Q2_NES_LATCH_PIN=${NES_LATCH_PIN}
+    Q2_NES_DATA_PIN=${NES_DATA_PIN}
 )
 
 # Board bring-up and the C heap, shared by the diag and game firmware
@@ -197,7 +234,6 @@ add_library(q2_platform STATIC
     src/common/font6x8.c
     src/common/fbcon.c
     src/rp2350/platform.c
-    src/rp2350/uart_buffered.c
     src/rp2350/q2_malloc.c
 )
 target_include_directories(q2_platform PUBLIC src/common src/rp2350 src/rp2350/compat)
@@ -210,7 +246,7 @@ target_link_libraries(q2_platform PUBLIC
 # Phase 0: hardware bring-up firmware
 # ---------------------------------------------------------------------
 if(NOT Q2_VIDEO_PIO) # the diag firmware is HSTX only
-add_executable(frank-quake2-diag src/diag/diag_main.c)
+add_executable(frank-quake2-diag src/diag/diag_main.c src/rp2350/uart_buffered.c)
 target_link_libraries(frank-quake2-diag q2_platform)
 target_link_options(frank-quake2-diag PRIVATE -Wl,--wrap=panic
     -Wl,--defsym=__q2_assets_offset=${Q2_ASSETS_OFFSET})
@@ -300,7 +336,7 @@ target_compile_definitions(frank-quake2 PRIVATE ESP_PLATFORM=1 PLATFORM_RP2350=1
 target_compile_options(frank-quake2 PRIVATE -fsigned-char)
 target_compile_definitions(frank-quake2 PRIVATE PICO_MALLOC_PANIC=0)
 target_compile_definitions(frank-quake2 PRIVATE ${Q2_DEFINES})
-target_link_libraries(frank-quake2 q2_platform hardware_dma hardware_xip_cache hardware_flash pico_multicore pico_sync)
+target_link_libraries(frank-quake2 q2_platform ps2kbd nespad hardware_dma hardware_xip_cache hardware_flash pico_multicore pico_sync)
 pico_set_linker_script(frank-quake2 ${CMAKE_CURRENT_SOURCE_DIR}/memmap_quake2.ld)
 target_link_options(frank-quake2 PRIVATE
     -Wl,--no-enum-size-warning
@@ -311,5 +347,37 @@ target_link_options(frank-quake2 PRIVATE
 )
 set_property(TARGET frank-quake2 APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/memmap_quake2.ld)
 pico_enable_stdio_usb(frank-quake2 0)
-pico_enable_stdio_uart(frank-quake2 1)
+pico_enable_stdio_uart(frank-quake2 0)
 pico_add_extra_outputs(frank-quake2)
+
+# An ordinary IDE or CLI build produces a self-describing UF2 in bin/<CONFIG>/.
+# Keep the original build/frank-quake2.uf2 too (picotool / flash.sh).
+if(BOARD_VARIANT STREQUAL "M1")
+    set(Q2_BIN_BOARD m1p2)
+elseif(BOARD_VARIANT STREQUAL "M2")
+    set(Q2_BIN_BOARD m2p2)
+else()
+    set(Q2_BIN_BOARD z0p2)
+endif()
+if(Q2_VIDEO_PIO)
+    set(Q2_BIN_VIDEO PIO)
+else()
+    set(Q2_BIN_VIDEO HSTX)
+endif()
+if(CPU_SPEED GREATER_EQUAL 504)
+    set(Q2_BIN_VOLT 1.65V)
+elseif(CPU_SPEED GREATER_EQUAL 378)
+    set(Q2_BIN_VOLT 1.60V)
+else()
+    set(Q2_BIN_VOLT 1.50V)
+endif()
+set(Q2_BIN_FILENAME "${Q2_BIN_BOARD}-frank-quake2-${Q2_BIN_VIDEO}-${AUDIO_TYPE}-${CPU_SPEED}MHz-${Q2_BIN_VOLT}-P${PSRAM_SPEED}-F${FLASH_SPEED}-v${Q2_VERSION}.uf2")
+set(Q2_BIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bin/$<CONFIG>")
+add_custom_command(TARGET frank-quake2 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${Q2_BIN_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_BINARY_DIR}/frank-quake2.uf2"
+        "${Q2_BIN_DIR}/${Q2_BIN_FILENAME}"
+    COMMENT "Firmware: bin/$<CONFIG>/${Q2_BIN_FILENAME}"
+    VERBATIM
+)

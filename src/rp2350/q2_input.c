@@ -4,18 +4,20 @@
  * Copyright (c) 2026 Mikhail Matveev <xtreme@rh1.tech>
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Input: USB HID keyboard and mouse (TinyUSB host, drivers/usbhid) and the
- * UART console. Polled once per frame on the game core, before the frame.
+ * Input: USB HID keyboard/mouse and PIO PS/2 keyboard concurrently.
+ * Polled once per frame on the game core; PS/2 RX is interrupt buffered.
  */
 
 #include <stdio.h>
-#include <string.h>
 
 #include "client/keys.h"
+#include "hardware/clocks.h"
 #include "pico/stdlib.h"
 #include "q2_platform.h"
 #include "quake2.h"
 #include "usbhid.h"
+#include "ps2kbd.h"
+#include "nespad.h"
 
 /* HID usage (keyboard page) -> Quake key, 0: none */
 static const unsigned char hid_to_key[256] = {
@@ -40,60 +42,93 @@ static const unsigned char hid_to_key[256] = {
     [0x61] = K_KP_PGUP, [0x62] = K_KP_INS, [0x63] = K_KP_DEL, [0x64] = '\\',
     /* drivers/usbhid reports the modifiers as these, left and right merged */
     [0xE0] = K_CTRL, [0xE1] = K_SHIFT, [0xE2] = K_ALT,
+    [0xE4] = K_CTRL, [0xE5] = K_SHIFT, [0xE6] = K_ALT,
 };
 
 static int mouse_dx, mouse_dy;
 static uint8_t mouse_buttons;
 
-/* ---- UART console: lines for the Quake console ---- */
+/* Key ownership by source: two keyboards can hold the same key without
+ * one keyboard's key-up prematurely releasing the other's key.  USB HID
+ * usages are the common intermediate representation for both protocols. */
+static uint8_t source_held[4][256]; /* USB, PS/2, NES pad 1 and 2 */
+static uint8_t quake_held[256];
 
-#define NLINES 4
-static char uart_line[128];
-static int uart_len;
-static char lines[NLINES][128];
-static unsigned lines_wr, lines_rd;
-
-static void uart_poll(void) {
-    int ch;
-    while ((ch = getchar_timeout_us(0)) >= 0) {
-        platform_uart_cmd(ch); /* ~BOOT~, ~RST~ */
-        if (ch == '\r' || ch == '\n') {
-            if (uart_len && uart_line[0] != '~' && lines_wr - lines_rd < NLINES) {
-                uart_line[uart_len] = 0;
-                memcpy(lines[lines_wr % NLINES], uart_line, (size_t)uart_len + 1);
-                lines_wr++;
-            }
-            uart_len = 0;
-        } else if (ch == 8 || ch == 127) {
-            if (uart_len) uart_len--;
-        } else if (uart_len < (int)sizeof(uart_line) - 1 && ch >= 32) {
-            uart_line[uart_len++] = (char)ch;
-        }
+static void keyboard_action(int source, uint8_t code, int down) {
+    uint8_t key = hid_to_key[code];
+    if (!key) return;
+    uint8_t old = source_held[source][code];
+    if (!!down == !!old) {
+        /* PS/2 typematic repeats are useful in the Quake console. */
+        if (source == 1 && down && quake_held[key] == 1)
+            Quake2_SendKey(key, true);
+        return;
+    }
+    source_held[source][code] = !!down;
+    if (down) {
+        if (quake_held[key]++ == 0) Quake2_SendKey(key, true);
+    } else if (quake_held[key] && --quake_held[key] == 0) {
+        Quake2_SendKey(key, false);
     }
 }
 
-/* Engine interface (Sys_ConsoleInput): the next console line, NULL if none */
-char *QG_ConsoleInput(void) {
-    static char line[128];
-    uart_poll();
-    if (lines_rd == lines_wr) return NULL;
-    strcpy(line, lines[lines_rd % NLINES]);
-    lines_rd++;
-    return line;
+/* NES/SNES pad mappings to ordinary keyboard bindings, including Quake II's
+ * default movement keys. Both ports can control the local player.
+ * A=fire, B=jump, Start=menu, Select=inventory, L/R=strafe. */
+static const struct { uint32_t button; uint8_t hid; } pad_keys[] = {
+    { DPAD_UP,    0x52 }, /* Up arrow: forward */
+    { DPAD_DOWN,  0x51 }, /* Down arrow: back */
+    { DPAD_LEFT,  0x50 }, /* Left arrow: turn left */
+    { DPAD_RIGHT, 0x4f }, /* Right arrow: turn right */
+    { DPAD_A,     0xe0 }, /* Ctrl: fire */
+    { DPAD_B,     0x2c }, /* Space: jump */
+    { DPAD_START, 0x29 }, /* Escape: menu/back */
+    { DPAD_SELECT,0x2b }, /* Tab: inventory */
+    { DPAD_Y,     0xe1 }, /* Shift: run */
+    { DPAD_X,     0x38 }, /* Slash: next weapon */
+    { DPAD_LT,    0x04 }, /* A: strafe left */
+    { DPAD_RT,    0x07 }, /* D: strafe right */
+};
+static uint32_t pad_prev[2];
+
+static void poll_nespad(void) {
+    nespad_read();
+    const uint32_t state[2] = {nespad_state, nespad_state2};
+    for (int port = 0; port < 2; port++) {
+        uint32_t changed = state[port] ^ pad_prev[port];
+        for (unsigned i = 0; i < sizeof(pad_keys) / sizeof(pad_keys[0]); i++)
+            if (changed & pad_keys[i].button)
+                keyboard_action(2 + port, pad_keys[i].hid, !!(state[port] & pad_keys[i].button));
+        pad_prev[port] = state[port];
+    }
 }
 
-/* ---- USB ---- */
+void q2_input_init(void) {
+    bool ok = ps2kbd_init(pio1, Q2_PS2_CLK_PIN);
+    q2_con_printf("PS/2 keyboard GP%d/%d: %s\n", Q2_PS2_CLK_PIN,
+                  Q2_PS2_CLK_PIN + 1, ok ? "receiver ready" : "PIO unavailable");
+    ok = nespad_begin(clock_get_hz(clk_sys) / 1000, Q2_NES_CLK_PIN,
+                      Q2_NES_DATA_PIN, Q2_NES_LATCH_PIN);
+    q2_con_printf("NES/SNES pads CLK=%d LAT=%d DATA=%d/%d: %s\n",
+                  Q2_NES_CLK_PIN, Q2_NES_LATCH_PIN, Q2_NES_DATA_PIN,
+                  Q2_NES_DATA_PIN + 1, ok ? "ready" : "PIO unavailable");
+}
+
+/* The game has no serial console. Tilde on either keyboard opens Quake's. */
+char *QG_ConsoleInput(void) { return NULL; }
+
+/* ---- USB HID + PS/2 ---- */
 
 void q2_input_poll(void) {
     platform_usb_poll();
-    uart_poll();
 
     uint8_t code;
     int down;
-    while (usbhid_get_key_action(&code, &down)) {
-        int key = hid_to_key[code];
-        if (key) Quake2_SendKey(key, down);
-    }
+    while (usbhid_get_key_action(&code, &down))
+        keyboard_action(0, code, down);
+    while (ps2kbd_get_key_action(&code, &down))
+        keyboard_action(1, code, down);
+    poll_nespad();
 
     if (usbhid_mouse_connected()) {
         usbhid_mouse_state_t m;

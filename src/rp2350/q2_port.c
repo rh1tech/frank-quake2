@@ -26,6 +26,8 @@
 #include "quakegeneric.h"
 #include "ref_soft/r_local.h"
 #include "usbhid.h"
+#include "ps2kbd.h"
+#include "nespad.h"
 
 int QG_Milliseconds(void) {
     return (int)(time_us_64() / 1000);
@@ -301,12 +303,18 @@ void __attribute__((noreturn)) q2_halt(const char *msg) {
     sleep_ms(300);
     uint8_t code;
     int down;
+    uint32_t old_pad = nespad_state | nespad_state2;
     while (1) {
         platform_usb_poll();
         while (usbhid_get_key_action(&code, &down))
             if (down) platform_reboot(false);
-        int ch = getchar_timeout_us(1000);
-        if (ch >= 0) platform_uart_cmd(ch);
+        while (ps2kbd_get_key_action(&code, &down))
+            if (down) platform_reboot(false);
+        nespad_read();
+        uint32_t pad = nespad_state | nespad_state2;
+        if (pad & ~old_pad) platform_reboot(false);
+        old_pad = pad;
+        sleep_ms(1);
     }
 }
 
